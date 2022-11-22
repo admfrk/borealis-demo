@@ -1,15 +1,6 @@
 version: v1
 kind: kubernetes
-application: potato-facts2
-# Map of Deployment Targets, this is set up in a way where 
-# we can do multi-target deployments (multi-region or multi-cluster)
-
-##  New feature July 11, 2022
-#deploymentConfig:
-#  timeout:
-#    unit: minutes
-#    duration: 1
-
+application: potato-facts-w-argo-rollouts
 targets:  # The list of manifests sources
   # This in the name of a deployment, underneath it are its configuration
   dev:
@@ -80,15 +71,36 @@ targets:  # The list of manifests sources
       beforeDeployment:
         - pause:
             untilApproved: true
-
-manifests:  # The map of strategies, a deployment target will reference one of these
-  # This will read all yaml|yml files in a dir and deploy all manifests in that directory to all targets.
+  prod-operator:
+    # the name of an agent configured account
+    account: demo-prod-west-cluster
+    # Optionally override the namespaces that are in the manifests
+    namespace: borealis-argo
+    # This is the key to a strategy under the strategies map
+    strategy: rolling
+    constraints:
+      dependsOn: [ "infosec","staging" ]
+      beforeDeployment:
+        - pause:
+            untilApproved: true
+      afterDeployment:
+      - runWebhook:
+          name: Refer to Argo Rollouts for status
+manifests:  
   - path: manifests/potato-facts.yml
+    targets: ["infosec", "staging", "dev",prod-west, prod-eu, prod-east]
+  - path: manifests/argo-facts.yml
+    targets: ["prod-operator"]
   - path: manifests/potato-facts-external-service.yml
-    targets: [prod-west, prod-eu, prod-east]
+    targets: ["prod-operator",prod-west, prod-eu, prod-east]
   - path: manifests/potato-lies.yml
-
-strategies:  # Stragies names and definition
+    targets: ["infosec", "staging", "dev",prod-west, prod-eu, prod-east]
+strategies: 
+  rolling:
+    canary:
+      steps: 
+      - setWeight:
+          weight: 100
   # this is the name for the strategy
   mycanary:
     # This map key, is the deployment strategy type
@@ -99,11 +111,10 @@ strategies:  # Stragies names and definition
           - setWeight:
               weight: 25
           - analysis:
-              interval: 8
+              interval: 10
               units: seconds
               numberOfJudgmentRuns: 1
               rollBackMode: manual
-              lookbackMethod: GROWING
               rollForwardMode: automatic
               queries:
               - avgCPUUsage-pass
@@ -114,12 +125,11 @@ strategies:  # Stragies names and definition
           - setWeight:
               weight: 50
           - analysis:
-              interval: 8
+              interval: 10
               units: seconds
               numberOfJudgmentRuns: 3
               rollBackMode: manual
               rollForwardMode: manual
-              lookbackMethod: GROWING
               queries: 
               - avgCPUUsage-fail
               - avgCPUUsage-pass
@@ -127,23 +137,17 @@ strategies:  # Stragies names and definition
               name: Check_Logs
           - setWeight:
               weight: 100
-  rolling:
-    canary:
-      steps: 
-      - setWeight:
-          weight: 100
   myBlueGreen:
     blueGreen:
 
 # activeService: potato-facts-external
       redirectTrafficAfter:
         - analysis:
-            interval: 7
+            interval: 10
             units: seconds
             numberOfJudgmentRuns: 1
             rollBackMode: manual
             rollForwardMode: automatic
-            lookbackMethod: GROWING
             queries:
               - avgCPUUsage-pass
       shutDownOldVersionAfter:
@@ -152,11 +156,10 @@ strategies:  # Stragies names and definition
         - runWebhook:
             name: Check_Logs
         - analysis:
-            interval: 7
+            interval: 10
             units: seconds
             numberOfJudgmentRuns: 1
             rollBackMode: manual
-            lookbackMethod: GROWING
             queries:
               - avgCPUUsage-pass
 
@@ -188,24 +191,8 @@ trafficManagement:
       - activeService: potato-facts-external
       - activeService: potato-lies-external
 
+
 webhooks: #Note: All webhooks in this demo simply cann the github action workflow for the 'webhookCallback' event on a github repo. They have different names for demo purposes.
-  - name: Check_Logs
-    method: POST
-    uriTemplate: https://api.github.com/repos/{{secrets.github_org}}/{{secrets.github_repository}}/dispatches
-    headers:
-      - key: Authorization
-        value: token {{secrets.github_token}}
-      - key: Content-Type
-        value: application/json
-    bodyTemplate:
-      inline:  >-
-        {
-        "event_type": "webhookCallback",
-        "client_payload": {
-            "callbackUri": "{{armory.callbackUri}}/callback"
-            }
-        }
-    retryCount: 3
   - name: Security_Scanners
     method: POST
     uriTemplate: https://api.github.com/repos/{{secrets.github_org}}/{{secrets.github_repository}}/dispatches
@@ -218,6 +205,23 @@ webhooks: #Note: All webhooks in this demo simply cann the github action workflo
       inline:  >-
         {
         "event_type": "checkLogs",
+        "client_payload": {
+            "callbackUri": "{{armory.callbackUri}}/callback"
+            }
+        }
+    retryCount: 3
+  - name: Check_Logs
+    method: POST
+    uriTemplate: https://api.github.com/repos/{{secrets.github_org}}/{{secrets.github_repository}}/dispatches
+    headers:
+      - key: Authorization
+        value: token {{secrets.github_token}}
+      - key: Content-Type
+        value: application/json
+    bodyTemplate:
+      inline:  >-
+        {
+        "event_type": "webhookCallback",
         "client_payload": {
             "callbackUri": "{{armory.callbackUri}}/callback"
             }
@@ -240,3 +244,16 @@ webhooks: #Note: All webhooks in this demo simply cann the github action workflo
             }
         }
     retryCount: 3
+  - name: Refer to Argo Rollouts for status
+    method: POST
+    uriTemplate: http://cmd-hook.borealis-demo-agent-prod:8081/cmd
+    networkMode: remoteNetworkAgent
+    agentIdentifier: demo-prod-west-cluster
+    retryCount: 3
+    bodyTemplate:
+      inline:  >-
+        {
+        "cmd": "kubectl",
+        "arg": "wait -n=borealis-argo rollout/potato-facts --for=condition=Completed --timeout=30m",
+        "callbackURL": "{{armory.callbackUri}}/callback"
+        }
